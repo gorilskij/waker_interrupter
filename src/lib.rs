@@ -1,7 +1,7 @@
+use Message::*;
 use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
 use std::time::Duration;
-use Message::*;
 
 enum Message<T> {
     Message(T),
@@ -28,13 +28,23 @@ pub struct Receiver<T> {
     wake: Arc<(Mutex<Option<Message<T>>>, Condvar)>,
 }
 
-pub struct Interrupter<'a, T> {
-    mutex: &'a Mutex<Option<Message<T>>>,
+trait OpaqueOption {
+    fn is_some(&self) -> bool;
+}
+
+impl<T> OpaqueOption for Option<T> {
+    fn is_some(&self) -> bool {
+        Option::is_some(self)
+    }
+}
+
+pub struct Interrupter<'a> {
+    mutex: &'a Mutex<dyn OpaqueOption + 'a>,
     is_interrupted: bool,
 }
 
-impl<'a, T> Interrupter<'a, T> {
-    fn new(mutex: &'a Mutex<Option<Message<T>>>) -> Self {
+impl<'a> Interrupter<'a> {
+    fn new<T>(mutex: &'a Mutex<Option<Message<T>>>) -> Self {
         Self {
             mutex,
             is_interrupted: false,
@@ -55,7 +65,7 @@ impl<'a, T> Interrupter<'a, T> {
 }
 
 impl<T> Receiver<T> {
-    pub fn run(self, wake_interval: Duration, mut f: impl FnMut(T, Interrupter<T>)) {
+    pub fn run(self, wake_interval: Duration, mut f: impl FnMut(T, Interrupter)) {
         let (mutex, cvar) = &*self.wake;
         loop {
             let msg = {
