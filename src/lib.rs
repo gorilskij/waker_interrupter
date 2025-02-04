@@ -6,6 +6,7 @@ use Message::*;
 use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::Duration;
 
 enum Message<T> {
@@ -107,25 +108,46 @@ assert_impl_all!(MultiInterrupter: Send, Sync);
 
 macro_rules! run_function {
     ($name:ident, $interrupter:ident) => {
-        pub fn $name(self, wake_interval: Duration, mut f: impl FnMut(T, $interrupter)) {
+        pub fn $name(
+            self,
+            wake_interval: Option<Duration>,
+            holdoff: Option<Duration>,
+            mut f: impl FnMut(T, $interrupter),
+        ) {
             let (mutex, cvar) = &*self.wake;
-            loop {
-                let msg = {
+            'outer: loop {
+                let mut val = {
                     // the lock is only held inside this block
                     // outside, it's free to receive updates
                     let mut lock = mutex.lock();
                     loop {
-                        if let Some(msg) = lock.take() {
-                            break msg;
+                        match lock.take() {
+                            Some(Message(msg)) => break msg,
+                            Some(Terminate) => break 'outer,
+                            None => {}
                         }
-                        cvar.wait_for(&mut lock, wake_interval);
+
+                        if let Some(wake_interval) = wake_interval {
+                            cvar.wait_for(&mut lock, wake_interval);
+                        } else {
+                            cvar.wait(&mut lock);
+                        }
                     }
                 };
 
-                match msg {
-                    Message(val) => f(val, $interrupter::new(mutex)),
-                    Terminate => break,
+                if let Some(holdoff) = holdoff {
+                    loop {
+                        thread::sleep(holdoff);
+
+                        match mutex.lock().take() {
+                            Some(Message(new_val)) => val = new_val,
+                            Some(Terminate) => break 'outer,
+                            None => break,
+                        }
+                    }
                 }
+
+                f(val, $interrupter::new(mutex))
             }
         }
     };
