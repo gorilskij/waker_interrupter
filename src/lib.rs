@@ -1,6 +1,11 @@
+#[cfg(test)]
+#[macro_use]
+extern crate static_assertions;
+
 use Message::*;
 use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 enum Message<T> {
@@ -64,28 +69,74 @@ impl<'a> Interrupter<'a> {
     }
 }
 
-impl<T> Receiver<T> {
-    pub fn run(self, wake_interval: Duration, mut f: impl FnMut(T, Interrupter)) {
-        let (mutex, cvar) = &*self.wake;
-        loop {
-            let msg = {
-                // the lock is only held inside this block
-                // outside, it's free to receive updates
-                let mut lock = mutex.lock();
-                loop {
-                    if let Some(msg) = lock.take() {
-                        break msg;
-                    }
-                    cvar.wait_for(&mut lock, wake_interval);
-                }
-            };
+struct MultiInterrupterInner<'a> {
+    mutex: &'a Mutex<dyn OpaqueOption + Send + 'a>,
+    is_interrupted: AtomicBool,
+}
 
-            match msg {
-                Message(val) => f(val, Interrupter::new(mutex)),
-                Terminate => break,
-            }
+#[derive(Clone)]
+pub struct MultiInterrupter<'a> {
+    inner: Arc<MultiInterrupterInner<'a>>,
+}
+
+impl<'a> MultiInterrupter<'a> {
+    fn new<T: Send + 'a>(mutex: &'a Mutex<Option<Message<T>>>) -> Self {
+        Self {
+            inner: Arc::new(MultiInterrupterInner {
+                mutex,
+                is_interrupted: AtomicBool::new(false),
+            }),
         }
     }
+
+    pub fn interrupted(&self) -> bool {
+        if self.inner.is_interrupted.load(Ordering::Relaxed) {
+            true
+        } else if self.inner.mutex.lock().is_some() {
+            // the Mutex value won't be reset to None until the scope which owns the Interrupter returns
+            self.inner.is_interrupted.store(true, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+assert_impl_all!(MultiInterrupter: Send, Sync);
+
+macro_rules! run_function {
+    ($name:ident, $interrupter:ident) => {
+        pub fn $name(self, wake_interval: Duration, mut f: impl FnMut(T, $interrupter)) {
+            let (mutex, cvar) = &*self.wake;
+            loop {
+                let msg = {
+                    // the lock is only held inside this block
+                    // outside, it's free to receive updates
+                    let mut lock = mutex.lock();
+                    loop {
+                        if let Some(msg) = lock.take() {
+                            break msg;
+                        }
+                        cvar.wait_for(&mut lock, wake_interval);
+                    }
+                };
+
+                match msg {
+                    Message(val) => f(val, $interrupter::new(mutex)),
+                    Terminate => break,
+                }
+            }
+        }
+    };
+}
+
+impl<T> Receiver<T> {
+    run_function!(run, Interrupter);
+}
+
+impl<T: Send> Receiver<T> {
+    run_function!(run_multithreaded, MultiInterrupter);
 }
 
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
